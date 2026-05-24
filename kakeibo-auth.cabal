@@ -1,0 +1,28 @@
+cabal-version: 2.4
+name: kakeibo-auth
+version: 0.1.0.0
+build-type: Simple
+
+executable kakeibo-auth
+  main-is: Main.hs
+  hs-source-dirs: app
+  default-language: Haskell2010
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.18 && <5
+    , aeson
+    , base64
+    , bcrypt
+    , bytestring
+    , http-types
+    , postgresql-simple
+    , process
+    , resource-pool
+    , servant-server
+    , text
+    , time
+    , uuid
+    , uuid-types
+    , wai
+    , wai-cors
+    , warp

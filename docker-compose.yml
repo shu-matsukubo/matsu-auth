@@ -1,0 +1,39 @@
+services:
+  auth:
+    build:
+      context: .
+    container_name: Kakeibo_auth
+    ports:
+      - 18081:8080
+    environment:
+      - AUTH_PORT=8080
+      - AUTH_DATABASE_URL=postgres://kakeibo_auth:kakeibo_auth_pass@auth-db:5432/kakeibo_auth
+      - AUTH_ISSUER=http://localhost:18081
+      - AUTH_AUDIENCE=kakeibo-api
+      - AUTH_ACCESS_TOKEN_TTL_SECONDS=900
+      - AUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
+      - AUTH_PRIVATE_KEY_PATH=/app/keys/private.pem
+      - AUTH_JWKS_PATH=/app/keys/jwks.json
+      - AUTH_KEY_ID=kakeibo-dev-key-1
+      - AUTH_ALLOWED_ORIGIN=http://localhost:5173
+    volumes:
+      - ./keys:/app/keys:ro
+    depends_on:
+      - auth-db
+
+  auth-db:
+    image: postgres:16-alpine
+    container_name: Kakeibo_auth_db
+    ports:
+      - 15432:5432
+    environment:
+      - POSTGRES_DB=kakeibo_auth
+      - POSTGRES_USER=kakeibo_auth
+      - POSTGRES_PASSWORD=kakeibo_auth_pass
+      - TZ=Asia/Tokyo
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  auth_db_data:
