@@ -111,20 +111,20 @@ data UserRecord = UserRecord
 main :: IO ()
 main = do
   port <- readEnv "AUTH_PORT" 8080
-  databaseUrl <- textEnv "AUTH_DATABASE_URL" "postgres://kakeibo_auth:kakeibo_auth_pass@localhost:15432/kakeibo_auth"
+  databaseUrl <- textEnv "AUTH_DATABASE_URL" "postgres://matsu-auth:matsu-auth-pass@localhost:15432/matsu-auth"
   issuer <- textEnv "AUTH_ISSUER" "http://localhost:18081"
-  audience <- textEnv "AUTH_AUDIENCE" "kakeibo-api"
+  audience <- textEnv "AUTH_AUDIENCE" "matsu-api"
   accessTtl <- fromInteger <$> readEnv "AUTH_ACCESS_TOKEN_TTL_SECONDS" 900
   refreshTtl <- fromInteger <$> readEnv "AUTH_REFRESH_TOKEN_TTL_SECONDS" 2592000
   privateKeyPath <- stringEnv "AUTH_PRIVATE_KEY_PATH" "keys/private.pem"
   jwksPath <- stringEnv "AUTH_JWKS_PATH" "keys/jwks.json"
-  keyId <- textEnv "AUTH_KEY_ID" "kakeibo-dev-key-1"
+  keyId <- textEnv "AUTH_KEY_ID" "matsu-dev-key-1"
   allowedOrigin <- textEnv "AUTH_ALLOWED_ORIGIN" "http://localhost:5173"
   jwksBytes <- BL.readFile jwksPath
   jwks <- either fail pure (eitherDecode jwksBytes)
   pool <- createPool (connectPostgreSQL (TE.encodeUtf8 databaseUrl)) close 1 10 10
   let env = AppEnv pool issuer audience accessTtl refreshTtl privateKeyPath jwks keyId
-  putStrLn ("Kakeibo auth listening on :" <> show port)
+  putStrLn ("matsu auth listening on :" <> show port)
   run port (corsMiddleware allowedOrigin (serve (Proxy :: Proxy API) (server env)))
 
 server :: AppEnv -> Server API

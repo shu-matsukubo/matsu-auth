@@ -13,12 +13,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY kakeibo-auth.cabal cabal.project ./
+COPY matsu-auth.cabal cabal.project ./
 RUN cabal update && cabal build --only-dependencies
 
 COPY app ./app
-RUN cabal build exe:kakeibo-auth \
-    && cp "$(cabal list-bin exe:kakeibo-auth)" /usr/local/bin/kakeibo-auth
+RUN cabal build exe:matsu-auth \
+    && cp "$(cabal list-bin exe:matsu-auth)" /usr/local/bin/matsu-auth
 
 FROM debian:bookworm-slim
 
@@ -27,7 +27,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=build /usr/local/bin/kakeibo-auth /usr/local/bin/kakeibo-auth
+COPY --from=build /usr/local/bin/matsu-auth /usr/local/bin/matsu-auth
 
 EXPOSE 8080
-CMD ["kakeibo-auth"]
+CMD ["matsu-auth"]

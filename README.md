@@ -1,6 +1,6 @@
-# Kakeibo Auth
+# matsu Auth
 
-Haskell + Servant authentication server for the Kakeibo workspace.
+Haskell + Servant authentication server for the matsu workspace.
 
 ## Endpoints
 
@@ -28,9 +28,9 @@ PostgreSQL:
 
 ```text
 localhost:15432
-database: kakeibo_auth
-user: kakeibo_auth
-password: kakeibo_auth_pass
+database: matsu-auth
+user: matsu-auth
+password: matsu-auth-pass
 ```
 
 ## Development Key

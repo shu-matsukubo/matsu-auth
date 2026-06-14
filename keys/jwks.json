@@ -4,7 +4,7 @@
       "kty": "RSA",
       "n": "xuWae6j0Epdxrvzz4ttBG4uxilWVE6lCUsMDDcEb3AZWvS-5bNq0hSos0i6SNWxfqKX-SxhW-An7GyCOEyb0Iwu4b-quOLstqXld01dYAsTw3wS_i30UDD1vWus_D7l05GjM7NeKXd1rerAPhI4VcgiQarFntQIX8gFO5OGUQi35Y_b0O9RVkXYibtitOstiky1gfl7iIcI9g-NFioIaDo-Ld7vNYxLUeJB-QPmC0bDZpSemZ6AfNVevuJ_RB22aLH98yfUKZdHy_uvxiRMc9AV9Q9ZGOfATdmYYGRilyIctDjc4QVZTihTJ2NyXBcC-g4_XKWpwi-5aSPrhFjba7Q",
       "e": "AQAB",
-      "kid": "kakeibo-dev-key-1",
+      "kid": "matsu-dev-key-1",
       "use": "sig",
       "alg": "RS256"
     }
