@@ -6,14 +6,18 @@
 
 module Main where
 
+import AuthView (authorizationErrorPage, loginPage)
+import Control.Monad (unless, void)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (FromJSON, ToJSON, Value, eitherDecode, encode, object, (.=))
+import Data.Aeson (FromJSON, ToJSON (..), Value, eitherDecode, encode, object, (.=))
 import qualified Data.Base64.Types as B64Types
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64Url
 import qualified Data.ByteString.Lazy as BL
+import Data.Char (isAlphaNum)
 import Data.Int (Int64)
-import Data.Pool (Pool, createPool, withResource)
+import Data.Maybe (fromMaybe)
+import Data.Pool (Pool, defaultPoolConfig, newPool, withResource)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -28,11 +32,15 @@ import Database.PostgreSQL.Simple
     close,
     connectPostgreSQL,
     execute,
+    execute_,
     query,
+    withTransaction,
   )
 import GHC.Generics (Generic)
-import Network.HTTP.Types (hContentType)
-import Network.Wai (Middleware)
+import Lucid (Html, renderBS)
+import Network.HTTP.Types (hContentType, hLocation)
+import Network.HTTP.Types.URI (urlEncode)
+import Network.Wai (Middleware, mapResponseHeaders, rawPathInfo)
 import Network.Wai.Handler.Warp (run)
 import Network.Wai.Middleware.Cors
   ( CorsResourcePolicy (..),
@@ -40,6 +48,7 @@ import Network.Wai.Middleware.Cors
     simpleCorsResourcePolicy,
   )
 import Servant
+import Servant.HTML.Lucid (HTML)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (ExitSuccess))
 import System.IO (hClose)
@@ -50,6 +59,11 @@ import System.Process
     waitForProcess,
     withCreateProcess,
   )
+import Web.FormUrlEncoded
+  ( FromForm (..),
+    parseMaybe,
+    parseUnique,
+  )
 import qualified Crypto.BCrypt as BCrypt
 
 type API =
@@ -58,6 +72,22 @@ type API =
     :<|> "auth" :> "login" :> ReqBody '[JSON] AuthRequest :> Post '[JSON] TokenResponse
     :<|> "auth" :> "refresh" :> ReqBody '[JSON] RefreshRequest :> Post '[JSON] TokenResponse
     :<|> ".well-known" :> "jwks.json" :> Get '[JSON] Value
+    :<|> ".well-known" :> "oauth-authorization-server" :> Get '[JSON] Value
+    :<|> "oauth" :> "authorize"
+      :> QueryParam' '[Required] "response_type" Text
+      :> QueryParam' '[Required] "client_id" Text
+      :> QueryParam' '[Required] "redirect_uri" Text
+      :> QueryParam "scope" Text
+      :> QueryParam' '[Required] "state" Text
+      :> QueryParam' '[Required] "code_challenge" Text
+      :> QueryParam' '[Required] "code_challenge_method" Text
+      :> Get '[HTML] (Html ())
+    :<|> "oauth" :> "authorize"
+      :> ReqBody '[FormUrlEncoded] AuthorizeForm
+      :> Post '[HTML] (Html ())
+    :<|> "oauth" :> "token"
+      :> ReqBody '[FormUrlEncoded] OAuthTokenRequest
+      :> Post '[JSON] OAuthTokenResponse
 
 data AppEnv = AppEnv
   { envPool :: Pool Connection,
@@ -65,9 +95,16 @@ data AppEnv = AppEnv
     envAudience :: Text,
     envAccessTokenTtl :: NominalDiffTime,
     envRefreshTokenTtl :: NominalDiffTime,
+    envAuthorizationRequestTtl :: NominalDiffTime,
+    envAuthorizationCodeTtl :: NominalDiffTime,
     envPrivateKeyPath :: FilePath,
     envJwks :: Value,
-    envKeyId :: Text
+    envKeyId :: Text,
+    envClientId :: Text,
+    envClientSecret :: Text,
+    envRedirectUri :: Text,
+    envScope :: Text,
+    envLoginStartUri :: Text
   }
 
 data AuthRequest = AuthRequest
@@ -95,6 +132,63 @@ data TokenResponse = TokenResponse
 
 instance ToJSON TokenResponse
 
+data OAuthTokenResponse = OAuthTokenResponse
+  { oauthAccessToken :: Text,
+    oauthRefreshToken :: Text,
+    oauthTokenType :: Text,
+    oauthExpiresIn :: Int,
+    oauthScope :: Text
+  }
+  deriving (Show)
+
+instance ToJSON OAuthTokenResponse where
+  toJSON response =
+    object
+      [ "access_token" .= oauthAccessToken response,
+        "refresh_token" .= oauthRefreshToken response,
+        "token_type" .= oauthTokenType response,
+        "expires_in" .= oauthExpiresIn response,
+        "scope" .= oauthScope response
+      ]
+
+data AuthorizeForm = AuthorizeForm
+  { authorizeRequestId :: Text,
+    authorizeEmail :: Text,
+    authorizePassword :: Text,
+    authorizeAction :: Text
+  }
+  deriving (Show)
+
+instance FromForm AuthorizeForm where
+  fromForm form =
+    AuthorizeForm
+      <$> parseUnique "request_id" form
+      <*> parseUnique "email" form
+      <*> parseUnique "password" form
+      <*> parseUnique "action" form
+
+data OAuthTokenRequest = OAuthTokenRequest
+  { oauthGrantType :: Text,
+    oauthCode :: Maybe Text,
+    oauthRedirectUri :: Maybe Text,
+    oauthClientId :: Maybe Text,
+    oauthClientSecret :: Maybe Text,
+    oauthCodeVerifier :: Maybe Text,
+    oauthRefreshTokenRequest :: Maybe Text
+  }
+  deriving (Show)
+
+instance FromForm OAuthTokenRequest where
+  fromForm form =
+    OAuthTokenRequest
+      <$> parseUnique "grant_type" form
+      <*> parseMaybe "code" form
+      <*> parseMaybe "redirect_uri" form
+      <*> parseMaybe "client_id" form
+      <*> parseMaybe "client_secret" form
+      <*> parseMaybe "code_verifier" form
+      <*> parseMaybe "refresh_token" form
+
 data HealthResponse = HealthResponse
   { status :: Text
   }
@@ -108,6 +202,25 @@ data UserRecord = UserRecord
     userPasswordHash :: Text
   }
 
+data AuthorizationRequestRecord = AuthorizationRequestRecord
+  { authorizationRequestId :: Text,
+    authorizationClientId :: Text,
+    authorizationRedirectUri :: Text,
+    authorizationState :: Text,
+    authorizationScope :: Text,
+    authorizationCodeChallenge :: Text
+  }
+
+data AuthorizationCodeRecord = AuthorizationCodeRecord
+  { codeValue :: Text,
+    codeUserSub :: UUID,
+    codeUserEmail :: Text,
+    codeClientId :: Text,
+    codeRedirectUri :: Text,
+    codeChallenge :: Text,
+    codeScope :: Text
+  }
+
 main :: IO ()
 main = do
   port <- readEnv "AUTH_PORT" 8080
@@ -116,16 +229,52 @@ main = do
   audience <- textEnv "AUTH_AUDIENCE" "matsu-api"
   accessTtl <- fromInteger <$> readEnv "AUTH_ACCESS_TOKEN_TTL_SECONDS" 900
   refreshTtl <- fromInteger <$> readEnv "AUTH_REFRESH_TOKEN_TTL_SECONDS" 2592000
+  authorizationRequestTtl <- fromInteger <$> readEnv "AUTH_AUTHORIZATION_REQUEST_TTL_SECONDS" 600
+  authorizationCodeTtl <- fromInteger <$> readEnv "AUTH_AUTHORIZATION_CODE_TTL_SECONDS" 120
   privateKeyPath <- stringEnv "AUTH_PRIVATE_KEY_PATH" "keys/private.pem"
   jwksPath <- stringEnv "AUTH_JWKS_PATH" "keys/jwks.json"
   keyId <- textEnv "AUTH_KEY_ID" "matsu-dev-key-1"
   allowedOrigin <- textEnv "AUTH_ALLOWED_ORIGIN" "http://localhost:5173"
+  clientId <- textEnv "AUTH_CLIENT_ID" "matsu-bff"
+  clientSecret <- textEnv "AUTH_CLIENT_SECRET" "matsu-bff-dev-secret"
+  redirectUri <- textEnv "AUTH_REDIRECT_URI" "http://localhost:18082/auth/callback"
+  scope <- textEnv "AUTH_SCOPE" "matsu-api"
+  loginStartUri <- textEnv "AUTH_LOGIN_START_URI" "http://localhost:18082/auth/login"
   jwksBytes <- BL.readFile jwksPath
   jwks <- either fail pure (eitherDecode jwksBytes)
-  pool <- createPool (connectPostgreSQL (TE.encodeUtf8 databaseUrl)) close 1 10 10
-  let env = AppEnv pool issuer audience accessTtl refreshTtl privateKeyPath jwks keyId
+  pool <-
+    newPool $
+      defaultPoolConfig
+        (connectPostgreSQL (TE.encodeUtf8 databaseUrl))
+        close
+        10
+        10
+  ensureOAuthSchema pool
+  let env =
+        AppEnv
+          pool
+          issuer
+          audience
+          accessTtl
+          refreshTtl
+          authorizationRequestTtl
+          authorizationCodeTtl
+          privateKeyPath
+          jwks
+          keyId
+          clientId
+          clientSecret
+          redirectUri
+          scope
+          loginStartUri
   putStrLn ("matsu auth listening on :" <> show port)
-  run port (corsMiddleware allowedOrigin (serve (Proxy :: Proxy API) (server env)))
+  run
+    port
+    ( securityHeadersMiddleware
+        redirectUri
+        allowedOrigin
+        (corsMiddleware allowedOrigin (serve (Proxy :: Proxy API) (server env)))
+    )
 
 server :: AppEnv -> Server API
 server env =
@@ -134,45 +283,247 @@ server env =
     :<|> loginHandler env
     :<|> refreshHandler env
     :<|> pure (envJwks env)
+    :<|> pure (authorizationServerMetadata env)
+    :<|> authorizePageHandler env
+    :<|> authorizeSubmitHandler env
+    :<|> oauthTokenHandler env
 
 registerHandler :: AppEnv -> AuthRequest -> Handler TokenResponse
 registerHandler env req = do
   validateAuthRequest req
-  maybeExisting <- liftIO $ findUserByEmail env (email req)
-  case maybeExisting of
-    Just _ -> throwError err409 {errBody = "email already registered"}
-    Nothing -> do
-      sub <- liftIO nextRandom
-      hash <- liftIO $ hashPassword (password req)
-      _ <- liftIO $ insertUser env sub (email req) hash
-      issueTokens env sub (email req)
+  result <- liftIO $ registerUser env (email req) (password req)
+  case result of
+    Left message -> throwError err409 {errBody = BL.fromStrict (TE.encodeUtf8 message)}
+    Right user -> issueTokens env (userSub user) (userEmail user)
 
 loginHandler :: AppEnv -> AuthRequest -> Handler TokenResponse
 loginHandler env req = do
   validateAuthRequest req
-  maybeUser <- liftIO $ findUserByEmail env (email req)
-  case maybeUser of
-    Nothing -> throwError err401 {errBody = "invalid credentials"}
-    Just user -> do
-      let ok = BCrypt.validatePassword (TE.encodeUtf8 (userPasswordHash user)) (TE.encodeUtf8 (password req))
-      if ok
-        then issueTokens env (userSub user) (userEmail user)
-        else throwError err401 {errBody = "invalid credentials"}
+  result <- liftIO $ authenticateUser env (email req) (password req)
+  case result of
+    Left _ -> throwError err401 {errBody = "invalid credentials"}
+    Right user -> issueTokens env (userSub user) (userEmail user)
 
 refreshHandler :: AppEnv -> RefreshRequest -> Handler TokenResponse
-refreshHandler env (RefreshRequest token) = do
-  maybeUser <- liftIO $ findUserByRefreshToken env token
+refreshHandler env (RefreshRequest token) = refreshTokens env token
+
+authorizePageHandler ::
+  AppEnv ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe Text ->
+  Text ->
+  Text ->
+  Text ->
+  Handler (Html ())
+authorizePageHandler env responseType clientId redirectUri maybeScope state challenge challengeMethod = do
+  scope <- validateAuthorizationRequest env responseType clientId redirectUri maybeScope state challenge challengeMethod
+  requestId <- liftIO randomToken
+  now <- liftIO getCurrentTime
+  let request =
+        AuthorizationRequestRecord
+          requestId
+          clientId
+          redirectUri
+          state
+          scope
+          challenge
+  liftIO $ insertAuthorizationRequest env request (addUTCTime (envAuthorizationRequestTtl env) now)
+  pure (loginPage requestId Nothing)
+
+authorizeSubmitHandler :: AppEnv -> AuthorizeForm -> Handler (Html ())
+authorizeSubmitHandler env form = do
+  maybeRequest <- liftIO $ findAuthorizationRequest env (authorizeRequestId form)
+  case maybeRequest of
+    Nothing ->
+      throwAuthorizationPageError
+        env
+        "ログイン情報の有効期限が切れたか、すでに使用されています。"
+    Just request ->
+      case credentialValidationError (authorizeEmail form) (authorizePassword form) of
+        Just message -> pure (loginPage (authorizeRequestId form) (Just message))
+        Nothing -> do
+          userResult <-
+            liftIO $
+              case authorizeAction form of
+                "register" -> registerUser env (authorizeEmail form) (authorizePassword form)
+                "login" -> authenticateUser env (authorizeEmail form) (authorizePassword form)
+                _ -> pure (Left "操作を選択できませんでした。")
+          case userResult of
+            Left message -> pure (loginPage (authorizeRequestId form) (Just message))
+            Right user -> do
+              code <- liftIO randomToken
+              now <- liftIO getCurrentTime
+              created <-
+                liftIO $
+                  createAuthorizationCode
+                    env
+                    request
+                    user
+                    code
+                    (addUTCTime (envAuthorizationCodeTtl env) now)
+              unless created $
+                throwAuthorizationPageError
+                  env
+                  "ログイン情報の有効期限が切れたか、すでに使用されています。"
+              let location = authorizationCallbackLocation request code
+              throwError err303 {errHeaders = [(hLocation, TE.encodeUtf8 location)]}
+
+oauthTokenHandler :: AppEnv -> OAuthTokenRequest -> Handler OAuthTokenResponse
+oauthTokenHandler env request = do
+  validateOAuthClient env request
+  case oauthGrantType request of
+    "authorization_code" -> authorizationCodeGrant env request
+    "refresh_token" -> refreshTokenGrant env request
+    _ -> throwOAuthError err400 "unsupported_grant_type" "The grant_type is not supported."
+
+authorizationCodeGrant :: AppEnv -> OAuthTokenRequest -> Handler OAuthTokenResponse
+authorizationCodeGrant env request = do
+  code <- requireOAuthField "code" (oauthCode request)
+  redirectUri <- requireOAuthField "redirect_uri" (oauthRedirectUri request)
+  clientId <- requireOAuthField "client_id" (oauthClientId request)
+  verifier <- requireOAuthField "code_verifier" (oauthCodeVerifier request)
+  unless (validPkceVerifier verifier) $
+    throwOAuthError err400 "invalid_grant" "The code_verifier is invalid."
+  maybeCode <- liftIO $ findAuthorizationCode env code
+  case maybeCode of
+    Nothing -> throwOAuthError err400 "invalid_grant" "The authorization code is invalid or expired."
+    Just record -> do
+      unless
+        ( codeClientId record == clientId
+            && codeRedirectUri record == redirectUri
+        )
+        $ throwOAuthError err400 "invalid_grant" "The authorization code does not match this client."
+      actualChallenge <- liftIO $ pkceChallenge verifier
+      unless (actualChallenge == codeChallenge record) $
+        throwOAuthError err400 "invalid_grant" "PKCE verification failed."
+      consumed <- liftIO $ consumeAuthorizationCode env (codeValue record)
+      unless consumed $
+        throwOAuthError err400 "invalid_grant" "The authorization code was already used."
+      tokens <- issueTokens env (codeUserSub record) (codeUserEmail record)
+      pure (toOAuthTokenResponse (codeScope record) tokens)
+
+refreshTokenGrant :: AppEnv -> OAuthTokenRequest -> Handler OAuthTokenResponse
+refreshTokenGrant env request = do
+  token <- requireOAuthField "refresh_token" (oauthRefreshTokenRequest request)
+  tokens <- refreshTokens env token
+  pure (toOAuthTokenResponse (envScope env) tokens)
+
+refreshTokens :: AppEnv -> Text -> Handler TokenResponse
+refreshTokens env token = do
+  maybeUser <- liftIO $ consumeRefreshToken env token
   case maybeUser of
     Nothing -> throwError err401 {errBody = "invalid refresh token"}
-    Just user -> do
-      _ <- liftIO $ revokeRefreshToken env token
-      issueTokens env (userSub user) (userEmail user)
+    Just user -> issueTokens env (userSub user) (userEmail user)
+
+validateOAuthClient :: AppEnv -> OAuthTokenRequest -> Handler ()
+validateOAuthClient env request =
+  unless
+    ( oauthClientId request == Just (envClientId env)
+        && oauthClientSecret request == Just (envClientSecret env)
+    )
+    $ throwOAuthError err401 "invalid_client" "Client authentication failed."
+
+requireOAuthField :: Text -> Maybe Text -> Handler Text
+requireOAuthField fieldName maybeValue =
+  case maybeValue of
+    Just value | not (T.null value) -> pure value
+    _ -> throwOAuthError err400 "invalid_request" ("Missing " <> fieldName <> ".")
+
+throwOAuthError :: ServerError -> Text -> Text -> Handler a
+throwOAuthError baseError errorCode description =
+  throwError
+    baseError
+      { errBody =
+          encode
+            ( object
+                [ "error" .= errorCode,
+                  "error_description" .= description
+                ]
+            ),
+        errHeaders = [(hContentType, "application/json; charset=utf-8")]
+      }
+
+validateAuthorizationRequest ::
+  AppEnv ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe Text ->
+  Text ->
+  Text ->
+  Text ->
+  Handler Text
+validateAuthorizationRequest env responseType clientId redirectUri maybeScope state challenge challengeMethod = do
+  let invalidRequest =
+        throwAuthorizationPageError
+          env
+          "ログインを開始できませんでした。アプリからもう一度お試しください。"
+  unless (responseType == "code") invalidRequest
+  unless (clientId == envClientId env) invalidRequest
+  unless (redirectUri == envRedirectUri env) invalidRequest
+  unless (challengeMethod == "S256") invalidRequest
+  unless (validPkceChallenge challenge) invalidRequest
+  unless (not (T.null state) && T.length state <= 512) invalidRequest
+  let scope = fromMaybe (envScope env) maybeScope
+  unless (scope == envScope env) invalidRequest
+  pure scope
+
+throwAuthorizationPageError :: AppEnv -> Text -> Handler a
+throwAuthorizationPageError env message =
+  throwError
+    err400
+      { errBody = renderBS (authorizationErrorPage (envLoginStartUri env) message),
+        errHeaders = [(hContentType, "text/html; charset=utf-8")]
+      }
+
+validPkceChallenge :: Text -> Bool
+validPkceChallenge value = T.length value == 43 && T.all isPkceCharacter value
+
+validPkceVerifier :: Text -> Bool
+validPkceVerifier value =
+  T.length value >= 43
+    && T.length value <= 128
+    && T.all isPkceCharacter value
+
+isPkceCharacter :: Char -> Bool
+isPkceCharacter character =
+  isAlphaNum character || character `elem` ("-._~" :: String)
 
 validateAuthRequest :: AuthRequest -> Handler ()
-validateAuthRequest req
-  | T.length (password req) < 8 = throwError err400 {errBody = "password must be at least 8 characters"}
-  | not ("@" `T.isInfixOf` email req) = throwError err400 {errBody = "email is invalid"}
-  | otherwise = pure ()
+validateAuthRequest req =
+  case credentialValidationError (email req) (password req) of
+    Nothing -> pure ()
+    Just message -> throwError err400 {errBody = BL.fromStrict (TE.encodeUtf8 message)}
+
+credentialValidationError :: Text -> Text -> Maybe Text
+credentialValidationError emailAddress rawPassword
+  | T.length rawPassword < 8 = Just "パスワードは8文字以上で入力してください。"
+  | not ("@" `T.isInfixOf` emailAddress) = Just "メールアドレスを確認してください。"
+  | otherwise = Nothing
+
+authenticateUser :: AppEnv -> Text -> Text -> IO (Either Text UserRecord)
+authenticateUser env emailAddress rawPassword = do
+  maybeUser <- findUserByEmail env emailAddress
+  pure $
+    case maybeUser of
+      Nothing -> Left "メールアドレスまたはパスワードが正しくありません。"
+      Just user ->
+        if BCrypt.validatePassword (TE.encodeUtf8 (userPasswordHash user)) (TE.encodeUtf8 rawPassword)
+          then Right user
+          else Left "メールアドレスまたはパスワードが正しくありません。"
+
+registerUser :: AppEnv -> Text -> Text -> IO (Either Text UserRecord)
+registerUser env emailAddress rawPassword = do
+  maybeExisting <- findUserByEmail env emailAddress
+  case maybeExisting of
+    Just _ -> pure (Left "このメールアドレスはすでに登録されています。")
+    Nothing -> do
+      sub <- nextRandom
+      hash <- hashPassword rawPassword
+      _ <- insertUser env sub emailAddress hash
+      pure (Right (UserRecord sub emailAddress hash))
 
 hashPassword :: Text -> IO Text
 hashPassword raw = do
@@ -185,16 +536,25 @@ issueTokens :: AppEnv -> UUID -> Text -> Handler TokenResponse
 issueTokens env sub emailAddress = do
   now <- liftIO getCurrentTime
   access <- liftIO $ makeAccessToken env now sub emailAddress
-  refresh <- liftIO nextRandom
-  let refreshText = UUID.toText refresh
-  _ <- liftIO $ insertRefreshToken env refreshText sub (addUTCTime (envRefreshTokenTtl env) now)
+  refresh <- liftIO randomToken
+  _ <- liftIO $ insertRefreshToken env refresh sub (addUTCTime (envRefreshTokenTtl env) now)
   pure
     TokenResponse
       { accessToken = access,
-        refreshToken = refreshText,
+        refreshToken = refresh,
         tokenType = "Bearer",
         expiresIn = floor (envAccessTokenTtl env)
       }
+
+toOAuthTokenResponse :: Text -> TokenResponse -> OAuthTokenResponse
+toOAuthTokenResponse scope (TokenResponse access refresh tokenKind lifetime) =
+  OAuthTokenResponse
+    { oauthAccessToken = access,
+      oauthRefreshToken = refresh,
+      oauthTokenType = tokenKind,
+      oauthExpiresIn = lifetime,
+      oauthScope = scope
+    }
 
 makeAccessToken :: AppEnv -> UTCTime -> UUID -> Text -> IO Text
 makeAccessToken env now sub emailAddress = do
@@ -221,7 +581,15 @@ makeAccessToken env now sub emailAddress = do
   pure (unsigned <> "." <> base64Url signature)
 
 signRS256 :: FilePath -> BS.ByteString -> IO BS.ByteString
-signRS256 privateKeyPath input =
+signRS256 privateKeyPath =
+  runOpenSsl ["dgst", "-sha256", "-sign", privateKeyPath, "-binary"]
+
+pkceChallenge :: Text -> IO Text
+pkceChallenge verifier =
+  base64Url <$> runOpenSsl ["dgst", "-sha256", "-binary"] (TE.encodeUtf8 verifier)
+
+runOpenSsl :: [String] -> BS.ByteString -> IO BS.ByteString
+runOpenSsl arguments input =
   withCreateProcess opensslProcess $ \maybeIn maybeOut maybeErr processHandle -> do
     case (maybeIn, maybeOut, maybeErr) of
       (Just hin, Just hout, Just herr) -> do
@@ -232,15 +600,54 @@ signRS256 privateKeyPath input =
         exitCode <- waitForProcess processHandle
         case exitCode of
           ExitSuccess -> pure output
-          _ -> fail ("openssl signing failed: " <> show errOutput)
+          _ -> fail ("openssl command failed: " <> show errOutput)
       _ -> fail "failed to open openssl process handles"
   where
     opensslProcess =
-      (proc "openssl" ["dgst", "-sha256", "-sign", privateKeyPath, "-binary"])
+      (proc "openssl" arguments)
         { std_in = CreatePipe,
           std_out = CreatePipe,
           std_err = CreatePipe
         }
+
+randomToken :: IO Text
+randomToken = do
+  first <- nextRandom
+  second <- nextRandom
+  pure (T.filter (/= '-') (UUID.toText first <> UUID.toText second))
+
+authorizationCallbackLocation :: AuthorizationRequestRecord -> Text -> Text
+authorizationCallbackLocation request code =
+  authorizationRedirectUri request
+    <> separator
+    <> "code="
+    <> queryEncode code
+    <> "&state="
+    <> queryEncode (authorizationState request)
+  where
+    separator
+      | "?" `T.isInfixOf` authorizationRedirectUri request = "&"
+      | otherwise = "?"
+
+queryEncode :: Text -> Text
+queryEncode = TE.decodeUtf8 . urlEncode True . TE.encodeUtf8
+
+authorizationServerMetadata :: AppEnv -> Value
+authorizationServerMetadata env =
+  object
+    [ "issuer" .= envIssuer env,
+      "authorization_endpoint" .= issuerEndpoint env "/oauth/authorize",
+      "token_endpoint" .= issuerEndpoint env "/oauth/token",
+      "jwks_uri" .= issuerEndpoint env "/.well-known/jwks.json",
+      "response_types_supported" .= [("code" :: Text)],
+      "grant_types_supported" .= [("authorization_code" :: Text), "refresh_token"],
+      "code_challenge_methods_supported" .= [("S256" :: Text)],
+      "token_endpoint_auth_methods_supported" .= [("client_secret_post" :: Text)],
+      "scopes_supported" .= [envScope env]
+    ]
+
+issuerEndpoint :: AppEnv -> Text -> Text
+issuerEndpoint env path = T.dropWhileEnd (== '/') (envIssuer env) <> path
 
 findUserByEmail :: AppEnv -> Text -> IO (Maybe UserRecord)
 findUserByEmail env targetEmail =
@@ -248,13 +655,13 @@ findUserByEmail env targetEmail =
     rows <- query conn "SELECT sub, email, password_hash FROM users WHERE email = ?" (Only targetEmail)
     pure (rowToUser <$> firstMaybe rows)
 
-findUserByRefreshToken :: AppEnv -> Text -> IO (Maybe UserRecord)
-findUserByRefreshToken env token =
+consumeRefreshToken :: AppEnv -> Text -> IO (Maybe UserRecord)
+consumeRefreshToken env token =
   withResource (envPool env) $ \conn -> do
     rows <-
       query
         conn
-        "SELECT users.sub, users.email, users.password_hash FROM refresh_tokens INNER JOIN users ON users.sub = refresh_tokens.user_sub WHERE refresh_tokens.token = ? AND refresh_tokens.revoked_at IS NULL AND refresh_tokens.expires_at > now()"
+        "WITH revoked AS (UPDATE refresh_tokens SET revoked_at = now() WHERE token = ? AND revoked_at IS NULL AND expires_at > now() RETURNING user_sub) SELECT users.sub, users.email, users.password_hash FROM revoked INNER JOIN users ON users.sub = revoked.user_sub"
         (Only token)
     pure (rowToUser <$> firstMaybe rows)
 
@@ -274,13 +681,94 @@ insertRefreshToken env token sub expiresAt =
       "INSERT INTO refresh_tokens (token, user_sub, expires_at) VALUES (?, ?, ?)"
       (token, sub, expiresAt)
 
-revokeRefreshToken :: AppEnv -> Text -> IO Int64
-revokeRefreshToken env token =
+insertAuthorizationRequest :: AppEnv -> AuthorizationRequestRecord -> UTCTime -> IO ()
+insertAuthorizationRequest env request expiresAt =
+  withResource (envPool env) $ \conn -> do
+    void $
+      execute
+        conn
+        "INSERT INTO authorization_requests (request_id, client_id, redirect_uri, state, scope, code_challenge, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ( authorizationRequestId request,
+          authorizationClientId request,
+          authorizationRedirectUri request,
+          authorizationState request,
+          authorizationScope request,
+          authorizationCodeChallenge request,
+          expiresAt
+        )
+
+findAuthorizationRequest :: AppEnv -> Text -> IO (Maybe AuthorizationRequestRecord)
+findAuthorizationRequest env requestId =
+  withResource (envPool env) $ \conn -> do
+    rows <-
+      query
+        conn
+        "SELECT request_id, client_id, redirect_uri, state, scope, code_challenge FROM authorization_requests WHERE request_id = ? AND used_at IS NULL AND expires_at > now()"
+        (Only requestId)
+    pure (rowToAuthorizationRequest <$> firstMaybe rows)
+
+createAuthorizationCode ::
+  AppEnv ->
+  AuthorizationRequestRecord ->
+  UserRecord ->
+  Text ->
+  UTCTime ->
+  IO Bool
+createAuthorizationCode env request user code expiresAt =
   withResource (envPool env) $ \conn ->
-    execute conn "UPDATE refresh_tokens SET revoked_at = now() WHERE token = ?" (Only token)
+    withTransaction conn $ do
+      claimed <-
+        execute
+          conn
+          "UPDATE authorization_requests SET used_at = now() WHERE request_id = ? AND used_at IS NULL AND expires_at > now()"
+          (Only (authorizationRequestId request))
+      if claimed /= 1
+        then pure False
+        else do
+          _ <-
+            execute
+              conn
+              "INSERT INTO authorization_codes (code, user_sub, client_id, redirect_uri, code_challenge, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+              ( code,
+                userSub user,
+                authorizationClientId request,
+                authorizationRedirectUri request,
+                authorizationCodeChallenge request,
+                authorizationScope request,
+                expiresAt
+              )
+          pure True
+
+findAuthorizationCode :: AppEnv -> Text -> IO (Maybe AuthorizationCodeRecord)
+findAuthorizationCode env code =
+  withResource (envPool env) $ \conn -> do
+    rows <-
+      query
+        conn
+        "SELECT authorization_codes.code, users.sub, users.email, authorization_codes.client_id, authorization_codes.redirect_uri, authorization_codes.code_challenge, authorization_codes.scope FROM authorization_codes INNER JOIN users ON users.sub = authorization_codes.user_sub WHERE authorization_codes.code = ? AND authorization_codes.used_at IS NULL AND authorization_codes.expires_at > now()"
+        (Only code)
+    pure (rowToAuthorizationCode <$> firstMaybe rows)
+
+consumeAuthorizationCode :: AppEnv -> Text -> IO Bool
+consumeAuthorizationCode env code =
+  withResource (envPool env) $ \conn -> do
+    updated <-
+      execute
+        conn
+        "UPDATE authorization_codes SET used_at = now() WHERE code = ? AND used_at IS NULL AND expires_at > now()"
+        (Only code)
+    pure (updated == 1)
 
 rowToUser :: (UUID, Text, Text) -> UserRecord
 rowToUser (sub, emailAddress, passwordHash) = UserRecord sub emailAddress passwordHash
+
+rowToAuthorizationRequest :: (Text, Text, Text, Text, Text, Text) -> AuthorizationRequestRecord
+rowToAuthorizationRequest (requestId, clientId, redirectUri, state, scope, challenge) =
+  AuthorizationRequestRecord requestId clientId redirectUri state scope challenge
+
+rowToAuthorizationCode :: (Text, UUID, Text, Text, Text, Text, Text) -> AuthorizationCodeRecord
+rowToAuthorizationCode (code, sub, emailAddress, clientId, redirectUri, challenge, scope) =
+  AuthorizationCodeRecord code sub emailAddress clientId redirectUri challenge scope
 
 firstMaybe :: [a] -> Maybe a
 firstMaybe [] = Nothing
@@ -292,16 +780,64 @@ b64Json = base64Url . BL.toStrict . encode
 base64Url :: BS.ByteString -> Text
 base64Url = B64Types.extractBase64 . B64Url.encodeBase64Unpadded
 
+ensureOAuthSchema :: Pool Connection -> IO ()
+ensureOAuthSchema pool =
+  withResource pool $ \conn -> do
+    void $
+      execute_
+        conn
+        "CREATE TABLE IF NOT EXISTS authorization_requests (request_id text PRIMARY KEY, client_id text NOT NULL, redirect_uri text NOT NULL, state text NOT NULL, scope text NOT NULL, code_challenge text NOT NULL, expires_at timestamptz NOT NULL, used_at timestamptz, created_at timestamptz NOT NULL DEFAULT now())"
+    void $
+      execute_
+        conn
+        "CREATE INDEX IF NOT EXISTS authorization_requests_expires_at_idx ON authorization_requests(expires_at)"
+    void $
+      execute_
+        conn
+        "CREATE TABLE IF NOT EXISTS authorization_codes (code text PRIMARY KEY, user_sub uuid NOT NULL REFERENCES users(sub) ON DELETE CASCADE, client_id text NOT NULL, redirect_uri text NOT NULL, code_challenge text NOT NULL, scope text NOT NULL, expires_at timestamptz NOT NULL, used_at timestamptz, created_at timestamptz NOT NULL DEFAULT now())"
+    void $
+      execute_
+        conn
+        "CREATE INDEX IF NOT EXISTS authorization_codes_expires_at_idx ON authorization_codes(expires_at)"
+
 corsMiddleware :: Text -> Middleware
 corsMiddleware allowedOrigin =
-  cors $ \_ ->
-    Just
-      simpleCorsResourcePolicy
-        { corsOrigins = Just ([TE.encodeUtf8 allowedOrigin], True),
-          corsMethods = ["GET", "POST", "OPTIONS"],
-          corsRequestHeaders = ["authorization", "content-type"],
-          corsExposedHeaders = Just [hContentType]
-        }
+  cors $ \request ->
+    if rawPathInfo request == "/oauth/authorize"
+      then Nothing
+      else
+        Just
+          simpleCorsResourcePolicy
+            { corsOrigins = Just ([TE.encodeUtf8 allowedOrigin], True),
+              corsMethods = ["GET", "POST", "OPTIONS"],
+              corsRequestHeaders = ["authorization", "content-type"],
+              corsExposedHeaders = Just [hContentType]
+            }
+
+securityHeadersMiddleware :: Text -> Text -> Middleware
+securityHeadersMiddleware redirectUri frontendOrigin application request sendResponse =
+  application request (sendResponse . mapResponseHeaders (securityHeaders <>))
+  where
+    securityHeaders =
+      [ ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        ("X-Frame-Options", "DENY")
+      ]
+        <> authorizationPageHeaders
+    authorizationPageHeaders
+      | rawPathInfo request == "/oauth/authorize" =
+          [ ("Cache-Control", "no-store"),
+            ( "Content-Security-Policy",
+              TE.encodeUtf8
+                ( "default-src 'none'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self' "
+                    <> redirectUri
+                    <> " "
+                    <> frontendOrigin
+                    <> "; frame-ancestors 'none'; base-uri 'none'"
+                )
+            )
+          ]
+      | otherwise = []
 
 readEnv :: Read a => String -> a -> IO a
 readEnv key fallback = maybe fallback read <$> lookupEnv key

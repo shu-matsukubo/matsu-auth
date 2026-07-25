@@ -12,10 +12,17 @@ services:
       - AUTH_AUDIENCE=matsu-api
       - AUTH_ACCESS_TOKEN_TTL_SECONDS=900
       - AUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
+      - AUTH_AUTHORIZATION_REQUEST_TTL_SECONDS=600
+      - AUTH_AUTHORIZATION_CODE_TTL_SECONDS=120
       - AUTH_PRIVATE_KEY_PATH=/app/keys/private.pem
       - AUTH_JWKS_PATH=/app/keys/jwks.json
       - AUTH_KEY_ID=matsu-dev-key-1
       - AUTH_ALLOWED_ORIGIN=http://localhost:5173
+      - AUTH_CLIENT_ID=matsu-bff
+      - AUTH_CLIENT_SECRET=matsu-bff-dev-secret
+      - AUTH_REDIRECT_URI=http://localhost:18082/auth/callback
+      - AUTH_SCOPE=matsu-api
+      - AUTH_LOGIN_START_URI=http://localhost:18082/auth/login
     volumes:
       - ./keys:/app/keys:ro
     depends_on:

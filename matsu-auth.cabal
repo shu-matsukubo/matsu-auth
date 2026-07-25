@@ -5,6 +5,7 @@ build-type: Simple
 
 executable matsu-auth
   main-is: Main.hs
+  other-modules: AuthView
   hs-source-dirs: app
   default-language: Haskell2010
   ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
@@ -15,9 +16,12 @@ executable matsu-auth
     , bcrypt
     , bytestring
     , http-types
+    , http-api-data
+    , lucid
     , postgresql-simple
     , process
     , resource-pool
+    , servant-lucid
     , servant-server
     , text
     , time
