@@ -16,6 +16,7 @@ import qualified Data.ByteString.Base64.URL as B64Url
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAlphaNum)
 import Data.Int (Int64)
+import Data.List (nub)
 import Data.Maybe (fromMaybe)
 import Data.Pool (Pool, defaultPoolConfig, newPool, withResource)
 import Data.Text (Text)
@@ -93,6 +94,7 @@ data AppEnv = AppEnv
   { envPool :: Pool Connection,
     envIssuer :: Text,
     envAudience :: Text,
+    envAllowedResources :: [Text],
     envAccessTokenTtl :: NominalDiffTime,
     envRefreshTokenTtl :: NominalDiffTime,
     envAuthorizationRequestTtl :: NominalDiffTime,
@@ -109,7 +111,8 @@ data AppEnv = AppEnv
 
 data AuthRequest = AuthRequest
   { email :: Text,
-    password :: Text
+    password :: Text,
+    audience :: Maybe Text
   }
   deriving (Generic, Show)
 
@@ -221,12 +224,17 @@ data AuthorizationCodeRecord = AuthorizationCodeRecord
     codeScope :: Text
   }
 
+data RefreshTokenRecord = RefreshTokenRecord
+  { refreshUser :: UserRecord,
+    refreshAudience :: Text
+  }
+
 main :: IO ()
 main = do
   port <- readEnv "AUTH_PORT" 8080
   databaseUrl <- textEnv "AUTH_DATABASE_URL" "postgres://matsu-auth:matsu-auth-pass@localhost:15432/matsu-auth"
   issuer <- textEnv "AUTH_ISSUER" "http://localhost:18081"
-  audience <- textEnv "AUTH_AUDIENCE" "matsu-api"
+  defaultAudience <- textEnv "AUTH_AUDIENCE" "matsu-api"
   accessTtl <- fromInteger <$> readEnv "AUTH_ACCESS_TOKEN_TTL_SECONDS" 900
   refreshTtl <- fromInteger <$> readEnv "AUTH_REFRESH_TOKEN_TTL_SECONDS" 2592000
   authorizationRequestTtl <- fromInteger <$> readEnv "AUTH_AUTHORIZATION_REQUEST_TTL_SECONDS" 600
@@ -239,6 +247,9 @@ main = do
   clientSecret <- textEnv "AUTH_CLIENT_SECRET" "matsu-bff-dev-secret"
   redirectUri <- textEnv "AUTH_REDIRECT_URI" "http://localhost:18082/auth/callback"
   scope <- textEnv "AUTH_SCOPE" "matsu-api"
+  allowedResourcesRaw <- textEnv "AUTH_ALLOWED_RESOURCES" (defaultAudience <> "," <> scope)
+  allowedResources <-
+    either (fail . T.unpack) pure (parseAllowedResources defaultAudience scope allowedResourcesRaw)
   loginStartUri <- textEnv "AUTH_LOGIN_START_URI" "http://localhost:18082/auth/login"
   jwksBytes <- BL.readFile jwksPath
   jwks <- either fail pure (eitherDecode jwksBytes)
@@ -254,7 +265,8 @@ main = do
         AppEnv
           pool
           issuer
-          audience
+          defaultAudience
+          allowedResources
           accessTtl
           refreshTtl
           authorizationRequestTtl
@@ -291,21 +303,23 @@ server env =
 registerHandler :: AppEnv -> AuthRequest -> Handler TokenResponse
 registerHandler env req = do
   validateAuthRequest req
+  selectedAudience <- validateAudience env (audience req)
   result <- liftIO $ registerUser env (email req) (password req)
   case result of
     Left message -> throwError err409 {errBody = BL.fromStrict (TE.encodeUtf8 message)}
-    Right user -> issueTokens env (userSub user) (userEmail user)
+    Right user -> issueTokens env selectedAudience (userSub user) (userEmail user)
 
 loginHandler :: AppEnv -> AuthRequest -> Handler TokenResponse
 loginHandler env req = do
   validateAuthRequest req
+  selectedAudience <- validateAudience env (audience req)
   result <- liftIO $ authenticateUser env (email req) (password req)
   case result of
     Left _ -> throwError err401 {errBody = "invalid credentials"}
-    Right user -> issueTokens env (userSub user) (userEmail user)
+    Right user -> issueTokens env selectedAudience (userSub user) (userEmail user)
 
 refreshHandler :: AppEnv -> RefreshRequest -> Handler TokenResponse
-refreshHandler env (RefreshRequest token) = refreshTokens env token
+refreshHandler env (RefreshRequest token) = snd <$> refreshTokens env token
 
 authorizePageHandler ::
   AppEnv ->
@@ -401,21 +415,25 @@ authorizationCodeGrant env request = do
       consumed <- liftIO $ consumeAuthorizationCode env (codeValue record)
       unless consumed $
         throwOAuthError err400 "invalid_grant" "The authorization code was already used."
-      tokens <- issueTokens env (codeUserSub record) (codeUserEmail record)
+      tokens <- issueTokens env (codeScope record) (codeUserSub record) (codeUserEmail record)
       pure (toOAuthTokenResponse (codeScope record) tokens)
 
 refreshTokenGrant :: AppEnv -> OAuthTokenRequest -> Handler OAuthTokenResponse
 refreshTokenGrant env request = do
   token <- requireOAuthField "refresh_token" (oauthRefreshTokenRequest request)
-  tokens <- refreshTokens env token
-  pure (toOAuthTokenResponse (envScope env) tokens)
+  (tokenAudience, tokens) <- refreshTokens env token
+  pure (toOAuthTokenResponse tokenAudience tokens)
 
-refreshTokens :: AppEnv -> Text -> Handler TokenResponse
+refreshTokens :: AppEnv -> Text -> Handler (Text, TokenResponse)
 refreshTokens env token = do
-  maybeUser <- liftIO $ consumeRefreshToken env token
-  case maybeUser of
+  maybeRecord <- liftIO $ consumeRefreshToken env token
+  case maybeRecord of
     Nothing -> throwError err401 {errBody = "invalid refresh token"}
-    Just user -> issueTokens env (userSub user) (userEmail user)
+    Just record -> do
+      let user = refreshUser record
+          tokenAudience = refreshAudience record
+      tokens <- issueTokens env tokenAudience (userSub user) (userEmail user)
+      pure (tokenAudience, tokens)
 
 validateOAuthClient :: AppEnv -> OAuthTokenRequest -> Handler ()
 validateOAuthClient env request =
@@ -467,7 +485,7 @@ validateAuthorizationRequest env responseType clientId redirectUri maybeScope st
   unless (validPkceChallenge challenge) invalidRequest
   unless (not (T.null state) && T.length state <= 512) invalidRequest
   let scope = fromMaybe (envScope env) maybeScope
-  unless (scope == envScope env) invalidRequest
+  unless (scope `elem` envAllowedResources env) invalidRequest
   pure scope
 
 throwAuthorizationPageError :: AppEnv -> Text -> Handler a
@@ -503,6 +521,14 @@ credentialValidationError emailAddress rawPassword
   | not ("@" `T.isInfixOf` emailAddress) = Just "メールアドレスを確認してください。"
   | otherwise = Nothing
 
+validateAudience :: AppEnv -> Maybe Text -> Handler Text
+validateAudience env maybeAudience = do
+  let selectedAudience = fromMaybe (envAudience env) maybeAudience
+  unless
+    (not (T.null selectedAudience) && selectedAudience `elem` envAllowedResources env)
+    (throwError err400 {errBody = "unsupported audience"})
+  pure selectedAudience
+
 authenticateUser :: AppEnv -> Text -> Text -> IO (Either Text UserRecord)
 authenticateUser env emailAddress rawPassword = do
   maybeUser <- findUserByEmail env emailAddress
@@ -532,12 +558,19 @@ hashPassword raw = do
     Nothing -> fail "failed to hash password"
     Just hashed -> pure (TE.decodeUtf8 hashed)
 
-issueTokens :: AppEnv -> UUID -> Text -> Handler TokenResponse
-issueTokens env sub emailAddress = do
+issueTokens :: AppEnv -> Text -> UUID -> Text -> Handler TokenResponse
+issueTokens env tokenAudience sub emailAddress = do
   now <- liftIO getCurrentTime
-  access <- liftIO $ makeAccessToken env now sub emailAddress
+  access <- liftIO $ makeAccessToken env tokenAudience now sub emailAddress
   refresh <- liftIO randomToken
-  _ <- liftIO $ insertRefreshToken env refresh sub (addUTCTime (envRefreshTokenTtl env) now)
+  _ <-
+    liftIO $
+      insertRefreshToken
+        env
+        refresh
+        sub
+        tokenAudience
+        (addUTCTime (envRefreshTokenTtl env) now)
   pure
     TokenResponse
       { accessToken = access,
@@ -556,8 +589,8 @@ toOAuthTokenResponse scope (TokenResponse access refresh tokenKind lifetime) =
       oauthScope = scope
     }
 
-makeAccessToken :: AppEnv -> UTCTime -> UUID -> Text -> IO Text
-makeAccessToken env now sub emailAddress = do
+makeAccessToken :: AppEnv -> Text -> UTCTime -> UUID -> Text -> IO Text
+makeAccessToken env tokenAudience now sub emailAddress = do
   let iat = floor (utcTimeToPOSIXSeconds now) :: Int
       expTime = floor (utcTimeToPOSIXSeconds (addUTCTime (envAccessTokenTtl env) now)) :: Int
       header =
@@ -569,7 +602,7 @@ makeAccessToken env now sub emailAddress = do
       payload =
         object
           [ "iss" .= envIssuer env,
-            "aud" .= envAudience env,
+            "aud" .= tokenAudience,
             "sub" .= UUID.toText sub,
             "email" .= emailAddress,
             "token_use" .= ("access" :: Text),
@@ -643,7 +676,7 @@ authorizationServerMetadata env =
       "grant_types_supported" .= [("authorization_code" :: Text), "refresh_token"],
       "code_challenge_methods_supported" .= [("S256" :: Text)],
       "token_endpoint_auth_methods_supported" .= [("client_secret_post" :: Text)],
-      "scopes_supported" .= [envScope env]
+      "scopes_supported" .= envAllowedResources env
     ]
 
 issuerEndpoint :: AppEnv -> Text -> Text
@@ -655,15 +688,15 @@ findUserByEmail env targetEmail =
     rows <- query conn "SELECT sub, email, password_hash FROM users WHERE email = ?" (Only targetEmail)
     pure (rowToUser <$> firstMaybe rows)
 
-consumeRefreshToken :: AppEnv -> Text -> IO (Maybe UserRecord)
+consumeRefreshToken :: AppEnv -> Text -> IO (Maybe RefreshTokenRecord)
 consumeRefreshToken env token =
   withResource (envPool env) $ \conn -> do
     rows <-
       query
         conn
-        "WITH revoked AS (UPDATE refresh_tokens SET revoked_at = now() WHERE token = ? AND revoked_at IS NULL AND expires_at > now() RETURNING user_sub) SELECT users.sub, users.email, users.password_hash FROM revoked INNER JOIN users ON users.sub = revoked.user_sub"
+        "WITH revoked AS (UPDATE refresh_tokens SET revoked_at = now() WHERE token = ? AND revoked_at IS NULL AND expires_at > now() RETURNING user_sub, audience) SELECT users.sub, users.email, users.password_hash, revoked.audience FROM revoked INNER JOIN users ON users.sub = revoked.user_sub"
         (Only token)
-    pure (rowToUser <$> firstMaybe rows)
+    pure (rowToRefreshToken <$> firstMaybe rows)
 
 insertUser :: AppEnv -> UUID -> Text -> Text -> IO Int64
 insertUser env sub emailAddress passwordHash =
@@ -673,13 +706,13 @@ insertUser env sub emailAddress passwordHash =
       "INSERT INTO users (sub, email, password_hash) VALUES (?, ?, ?)"
       (sub, emailAddress, passwordHash)
 
-insertRefreshToken :: AppEnv -> Text -> UUID -> UTCTime -> IO Int64
-insertRefreshToken env token sub expiresAt =
+insertRefreshToken :: AppEnv -> Text -> UUID -> Text -> UTCTime -> IO Int64
+insertRefreshToken env token sub tokenAudience expiresAt =
   withResource (envPool env) $ \conn ->
     execute
       conn
-      "INSERT INTO refresh_tokens (token, user_sub, expires_at) VALUES (?, ?, ?)"
-      (token, sub, expiresAt)
+      "INSERT INTO refresh_tokens (token, user_sub, audience, expires_at) VALUES (?, ?, ?, ?)"
+      (token, sub, tokenAudience, expiresAt)
 
 insertAuthorizationRequest :: AppEnv -> AuthorizationRequestRecord -> UTCTime -> IO ()
 insertAuthorizationRequest env request expiresAt =
@@ -762,6 +795,10 @@ consumeAuthorizationCode env code =
 rowToUser :: (UUID, Text, Text) -> UserRecord
 rowToUser (sub, emailAddress, passwordHash) = UserRecord sub emailAddress passwordHash
 
+rowToRefreshToken :: (UUID, Text, Text, Text) -> RefreshTokenRecord
+rowToRefreshToken (sub, emailAddress, passwordHash, tokenAudience) =
+  RefreshTokenRecord (UserRecord sub emailAddress passwordHash) tokenAudience
+
 rowToAuthorizationRequest :: (Text, Text, Text, Text, Text, Text) -> AuthorizationRequestRecord
 rowToAuthorizationRequest (requestId, clientId, redirectUri, state, scope, challenge) =
   AuthorizationRequestRecord requestId clientId redirectUri state scope challenge
@@ -783,6 +820,22 @@ base64Url = B64Types.extractBase64 . B64Url.encodeBase64Unpadded
 ensureOAuthSchema :: Pool Connection -> IO ()
 ensureOAuthSchema pool =
   withResource pool $ \conn -> do
+    void $
+      execute_
+        conn
+        "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS audience text"
+    void $
+      execute_
+        conn
+        "UPDATE refresh_tokens SET audience = 'matsu-api' WHERE audience IS NULL"
+    void $
+      execute_
+        conn
+        "ALTER TABLE refresh_tokens ALTER COLUMN audience SET DEFAULT 'matsu-api'"
+    void $
+      execute_
+        conn
+        "ALTER TABLE refresh_tokens ALTER COLUMN audience SET NOT NULL"
     void $
       execute_
         conn
@@ -847,3 +900,20 @@ textEnv key fallback = maybe fallback T.pack <$> lookupEnv key
 
 stringEnv :: String -> String -> IO String
 stringEnv key fallback = maybe fallback id <$> lookupEnv key
+
+parseAllowedResources :: Text -> Text -> Text -> Either Text [Text]
+parseAllowedResources defaultAudience defaultScope raw = do
+  let resources = nub (filter (not . T.null) (map T.strip (T.splitOn "," raw)))
+  unlessEither (not (null resources)) "AUTH_ALLOWED_RESOURCES must contain at least one resource."
+  unlessEither
+    (defaultAudience `elem` resources)
+    "AUTH_AUDIENCE must be included in AUTH_ALLOWED_RESOURCES."
+  unlessEither
+    (defaultScope `elem` resources)
+    "AUTH_SCOPE must be included in AUTH_ALLOWED_RESOURCES."
+  pure resources
+
+unlessEither :: Bool -> Text -> Either Text ()
+unlessEither condition message
+  | condition = Right ()
+  | otherwise = Left message

@@ -10,6 +10,7 @@ services:
       - AUTH_DATABASE_URL=postgres://matsu-auth:matsu-auth-pass@auth-db:5432/matsu-auth
       - AUTH_ISSUER=http://localhost:18081
       - AUTH_AUDIENCE=matsu-api
+      - AUTH_ALLOWED_RESOURCES=matsu-api,matsu-toolbox-api
       - AUTH_ACCESS_TOKEN_TTL_SECONDS=900
       - AUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
       - AUTH_AUTHORIZATION_REQUEST_TTL_SECONDS=600
@@ -26,7 +27,8 @@ services:
     volumes:
       - ./keys:/app/keys:ro
     depends_on:
-      - auth-db
+      auth-db:
+        condition: service_healthy
 
   auth-db:
     image: postgres:16-alpine
@@ -38,6 +40,11 @@ services:
       - POSTGRES_USER=matsu-auth
       - POSTGRES_PASSWORD=matsu-auth-pass
       - TZ=Asia/Tokyo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matsu-auth -d matsu-auth"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
     volumes:
       - auth_db_data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro

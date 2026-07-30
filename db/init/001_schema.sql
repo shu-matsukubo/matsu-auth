@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     token text PRIMARY KEY,
     user_sub uuid NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
+    audience text NOT NULL DEFAULT 'matsu-api',
     expires_at timestamptz NOT NULL,
     revoked_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now()
