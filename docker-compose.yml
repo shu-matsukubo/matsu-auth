@@ -51,3 +51,4 @@ services:
 
 volumes:
   auth_db_data:
+    name: matsu-auth-db-data
