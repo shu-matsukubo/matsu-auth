@@ -1,97 +1,82 @@
-# matsu Auth
+# matsu-auth
 
-Haskell + Servant authentication server for the matsu workspace.
+`matsu` ワークスペースの認証サーバーです。ブラウザのログインを受け付け、BFF を介して家計簿 API と Toolbox API で利用するトークンを発行します。Arcade の認証は独立した `matsu-arcade-auth` が担当します。
 
-It issues RS256 JWT access tokens for the allowlisted `matsu-api` and
-`matsu-toolbox-api` resource servers, plus refresh tokens that retain their original audience.
-Browser login uses an OAuth authorization code flow with PKCE and a server-rendered Lucid page.
+## 必要条件
 
-## Tech Stack
+- Docker Desktop または Docker Engine
+- Docker Compose v2
 
-- Haskell
-- Servant
-- PostgreSQL
-- Docker / Docker Compose
+Haskell のローカルツールチェーンは、Docker だけで開発する場合は不要です。
 
-## Endpoints
+## 初回準備
 
-- `GET /health`
-- `POST /auth/register`
-- `POST /auth/login`
-- `POST /auth/refresh`
-- `GET /oauth/authorize`
-- `POST /oauth/authorize`
-- `POST /oauth/token`
-- `GET /.well-known/jwks.json`
-- `GET /.well-known/oauth-authorization-server`
+リポジトリに含まれる次の鍵を確認してください。どちらもローカル開発専用で、追加生成は不要です。
 
-Access tokens are RS256 JWTs. The Laravel API verifies them with the JWKS endpoint.
+- `keys/private.pem`
+- `keys/jwks.json`
 
-## Local Start
+これらの鍵と `docker-compose.yml` の認証情報を、本番環境の secret として使用しないでください。本番相当の環境では、鍵と認証情報をリポジトリ外で管理します。
+
+## 起動と停止
+
+初回起動またはイメージを更新するときは、Auth と依存する PostgreSQL を起動します。
 
 ```bash
-docker compose up -d --build
+docker compose up -d --build auth
 ```
 
-Auth API:
+- Auth: `http://localhost:18081`
+- PostgreSQL: `localhost:15432`
 
-```text
-http://localhost:18081
-```
-
-PostgreSQL:
-
-```text
-localhost:15432
-database: matsu-auth
-user: matsu-auth
-password: matsu-auth-pass
-```
-
-## Environment
-
-Local Docker defaults:
-
-```text
-AUTH_PORT=8080
-AUTH_DATABASE_URL=postgres://matsu-auth:matsu-auth-pass@auth-db:5432/matsu-auth
-AUTH_ISSUER=http://localhost:18081
-AUTH_AUDIENCE=matsu-api
-AUTH_ALLOWED_RESOURCES=matsu-api,matsu-toolbox-api
-AUTH_ACCESS_TOKEN_TTL_SECONDS=900
-AUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
-AUTH_AUTHORIZATION_REQUEST_TTL_SECONDS=600
-AUTH_AUTHORIZATION_CODE_TTL_SECONDS=120
-AUTH_PRIVATE_KEY_PATH=/app/keys/private.pem
-AUTH_JWKS_PATH=/app/keys/jwks.json
-AUTH_KEY_ID=matsu-dev-key-1
-AUTH_ALLOWED_ORIGIN=http://localhost:5173
-AUTH_CLIENT_ID=matsu-bff
-AUTH_CLIENT_SECRET=matsu-bff-dev-secret
-AUTH_REDIRECT_URI=http://localhost:18082/auth/callback
-AUTH_SCOPE=matsu-api
-AUTH_LOGIN_START_URI=http://localhost:18082/auth/login
-```
-
-`AUTH_CLIENT_SECRET` and the development key files are local-only values. Replace them in deployed environments.
-`AUTH_LOGIN_START_URI` is the retry destination shown when a browser authorization request is invalid or expired.
-
-`AUTH_AUDIENCE` and `AUTH_SCOPE` remain the default resource for backward compatibility.
-`AUTH_ALLOWED_RESOURCES` is a comma-separated allowlist. Direct register/login requests may
-select one entry with an optional `audience` field; omitted values continue to use `matsu-api`.
-OAuth requests use the selected scope as the JWT audience. Refresh-token rotation always keeps
-the audience that was recorded when the refresh token was issued.
-
-Example Toolbox login:
+起動確認:
 
 ```bash
-curl -X POST http://localhost:18081/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","password":"password","audience":"matsu-toolbox-api"}'
+curl http://localhost:18081/health
 ```
 
-## Development Key
+ログ確認:
 
-`keys/private.pem` and `keys/jwks.json` are development-only key material so the full authentication flow can run locally without external secret management.
+```bash
+docker compose logs -f auth
+```
 
-For production-like environments, replace these files with keys managed outside the repository and rotate `kid` values deliberately.
+停止:
+
+```bash
+docker compose down
+```
+
+通常の停止では named volume を削除しません。DB を初期化する目的がない限り `docker compose down -v` は使用しないでください。
+
+## 開発
+
+ソースを変更した後はイメージを再ビルドし、Auth を再作成します。
+
+```bash
+docker compose build auth
+docker compose up -d auth
+```
+
+アプリケーションの依存関係と build 設定は `matsu-auth.cabal`、Docker build は `Dockerfile` を正本とします。ポート、DB 接続、issuer、許可する resource、BFF の callback、鍵のパスなどのローカル設定は `docker-compose.yml` を確認してください。
+
+DB の初期スキーマは、空の named volume で PostgreSQL を初回起動したときに `db/init/` から適用されます。
+
+## 品質確認
+
+現在、GitHub Actions の CI と自動 test-suite は導入されていません。変更時は少なくとも次を確認してください。
+
+```bash
+docker compose build auth
+docker compose up -d auth
+curl http://localhost:18081/health
+```
+
+認証フロー全体へ影響する変更では、BFF と対象 resource server を含むローカル環境で動作を確認します。
+
+## 設計資料
+
+- [Auth の責務と技術選定](https://github.com/shu-matsukubo/matsu-docs/blob/main/docs/components/auth.md)
+- [API 契約](https://github.com/shu-matsukubo/matsu-docs/blob/main/docs/architecture/api-contracts.md)
+- [認証とセッション](https://github.com/shu-matsukubo/matsu-docs/blob/main/docs/architecture/authentication.md)
+- [CI・静的解析・品質ゲート](https://github.com/shu-matsukubo/matsu-docs/blob/main/docs/architecture/quality-gates.md)
